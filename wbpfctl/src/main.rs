@@ -60,6 +60,24 @@ enum Command {
     #[structopt(long, default_value = "0")]
     offset: u32,
   },
+
+  /// Stop.
+  Stop {
+    /// Processing element index.
+    #[structopt(long, default_value = "0")]
+    pe_index: u32,
+  },
+
+  /// Start.
+  Start {
+    /// Processing element index.
+    #[structopt(long, default_value = "0")]
+    pe_index: u32,
+
+    /// PC.
+    #[structopt(long, default_value = "0")]
+    pc: u32,
+  },
 }
 
 fn main() -> Result<()> {
@@ -99,6 +117,14 @@ fn main() -> Result<()> {
       let code = read_input(&input)?;
       device.load_code(pe_index, offset, &code)?;
       log::info!("Code loaded. See dmesg.");
+    }
+    Command::Stop { pe_index } => {
+      device.stop(pe_index)?;
+      log::info!("Stopped.");
+    }
+    Command::Start { pe_index, pc } => {
+      device.start(pe_index, pc)?;
+      log::info!("Started.");
     }
   }
 
