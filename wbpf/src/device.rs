@@ -6,13 +6,12 @@ use std::{
 };
 
 use anyhow::Result;
-use nix::errno::Errno;
 
 use crate::{
   dm::DataMemory,
   uapi::{
-    wbpf_uapi_load_code_args, wbpf_uapi_start_args, wbpf_uapi_stop_args, WBPF_IOCTL_LOAD_CODE,
-    WBPF_IOCTL_START, WBPF_IOCTL_STOP,
+    ioc_load_code, ioc_start, ioc_stop, wbpf_uapi_load_code_args, wbpf_uapi_start_args,
+    wbpf_uapi_stop_args,
   },
 };
 
@@ -41,28 +40,25 @@ impl Device {
       code: code.as_ptr(),
       code_len: code.len() as u32,
     };
-    let ret = unsafe {
-      libc::ioctl(
-        self.file.as_raw_fd(),
-        WBPF_IOCTL_LOAD_CODE,
-        &args as *const _,
-      )
-    };
-    Errno::result(ret)?;
+    unsafe {
+      ioc_load_code(self.file.as_raw_fd(), &args)?;
+    }
     Ok(())
   }
 
   pub fn stop(&self, pe_index: u32) -> Result<()> {
     let args = wbpf_uapi_stop_args { pe_index };
-    let ret = unsafe { libc::ioctl(self.file.as_raw_fd(), WBPF_IOCTL_STOP, &args as *const _) };
-    Errno::result(ret)?;
+    unsafe {
+      ioc_stop(self.file.as_raw_fd(), &args)?;
+    }
     Ok(())
   }
 
   pub fn start(&self, pe_index: u32, pc: u32) -> Result<()> {
     let args = wbpf_uapi_start_args { pe_index, pc };
-    let ret = unsafe { libc::ioctl(self.file.as_raw_fd(), WBPF_IOCTL_START, &args as *const _) };
-    Errno::result(ret)?;
+    unsafe {
+      ioc_start(self.file.as_raw_fd(), &args)?;
+    }
     Ok(())
   }
 }
