@@ -34,6 +34,10 @@ enum Command {
     /// Size in bytes.
     #[structopt(long)]
     size: u32,
+
+    /// Use DMA.
+    #[structopt(long)]
+    dma: bool,
   },
   /// Write data memory.
   DmWrite {
@@ -44,6 +48,10 @@ enum Command {
     /// Memory offset in bytes.
     #[structopt(long, default_value = "0")]
     offset: u32,
+
+    /// Use DMA.
+    #[structopt(long)]
+    dma: bool,
   },
 
   /// Load code.
@@ -90,6 +98,7 @@ fn main() -> Result<()> {
       output,
       offset,
       size,
+      dma,
     } => {
       let mut f: Box<dyn Write> = if output.to_string_lossy() == "-" {
         Box::new(stdout())
@@ -97,15 +106,28 @@ fn main() -> Result<()> {
         Box::new(OpenOptions::new().write(true).create(true).open(&output)?)
       };
       let device_dm = device.data_memory()?;
-      let dm = device_dm.do_read(offset as _, size as _)?;
-      f.write_all(&dm)?;
-      log::info!("Read {} bytes from data memory.", dm.len());
+      let mut buffer = vec![0u8; size as usize];
+
+      if dma {
+        device_dm.do_dma_read(offset, &mut buffer)?;
+      } else {
+        device_dm.do_read(offset, &mut buffer)?;
+      }
+
+      f.write_all(&buffer)?;
+      log::info!("Read {} bytes from data memory.", buffer.len());
     }
 
-    Command::DmWrite { input, offset } => {
+    Command::DmWrite { input, offset, dma } => {
       let buf = read_input(&input)?;
       let device_dm = device.data_memory()?;
-      device_dm.do_write(offset as _, &buf)?;
+
+      if dma {
+        device_dm.do_dma_write(offset, &buf)?;
+      } else {
+        device_dm.do_write(offset, &buf)?;
+      }
+
       log::info!("Wrote {} bytes to data memory.", buf.len());
     }
 
