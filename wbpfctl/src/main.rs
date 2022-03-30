@@ -5,15 +5,22 @@ use std::{
 };
 
 use anyhow::Result;
+use bumpalo::Bump;
 use structopt::StructOpt;
-use wbpf::device::Device;
+use wbpf::{
+  device::Device,
+  linker::{
+    global_linker::{GlobalLinker, GlobalLinkerConfig},
+    image::{HostPlatform, TargetMachine},
+  },
+};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "wbpfctl", about = "wBPF control")]
 struct Opt {
   /// Path to device.
   #[structopt(long, short = "d")]
-  device: PathBuf,
+  device: Option<PathBuf>,
 
   #[structopt(subcommand)]
   cmd: Command,
@@ -86,12 +93,33 @@ enum Command {
     #[structopt(long, default_value = "0")]
     pc: u32,
   },
+
+  /// Link.
+  Link {
+    /// Input list.
+    input: Vec<PathBuf>,
+
+    /// Target machine JSON config.
+    #[structopt(long)]
+    target_machine: Option<PathBuf>,
+
+    /// Host platform JSON config.
+    #[structopt(long)]
+    host_platform: Option<PathBuf>,
+  },
 }
 
 fn main() -> Result<()> {
   pretty_env_logger::init_timed();
   let opt = Opt::from_args();
-  let device = Device::open(&opt.device)?;
+
+  let open_device = || {
+    if let Some(device) = &opt.device {
+      Device::open(&device).map_err(anyhow::Error::from)
+    } else {
+      Err(anyhow::anyhow!("no device specified"))
+    }
+  };
 
   match opt.cmd {
     Command::DmRead {
@@ -100,6 +128,7 @@ fn main() -> Result<()> {
       size,
       dma,
     } => {
+      let device = open_device()?;
       let mut f: Box<dyn Write> = if output.to_string_lossy() == "-" {
         Box::new(stdout())
       } else {
@@ -119,6 +148,7 @@ fn main() -> Result<()> {
     }
 
     Command::DmWrite { input, offset, dma } => {
+      let device = open_device()?;
       let buf = read_input(&input)?;
       let device_dm = device.data_memory()?;
 
@@ -136,17 +166,52 @@ fn main() -> Result<()> {
       pe_index,
       offset,
     } => {
+      let device = open_device()?;
       let code = read_input(&input)?;
       device.load_code(pe_index, offset, &code)?;
       log::info!("Code loaded. See dmesg.");
     }
     Command::Stop { pe_index } => {
+      let device = open_device()?;
       device.stop(pe_index)?;
       log::info!("Stopped.");
     }
     Command::Start { pe_index, pc } => {
+      let device = open_device()?;
       device.start(pe_index, pc)?;
       log::info!("Started.");
+    }
+    Command::Link {
+      input,
+      target_machine,
+      host_platform,
+    } => {
+      let target_machine: TargetMachine = if let Some(p) = &target_machine {
+        serde_json::from_str(&std::fs::read_to_string(p)?)?
+      } else {
+        Default::default()
+      };
+      let host_platform: HostPlatform = if let Some(p) = &host_platform {
+        serde_json::from_str(&std::fs::read_to_string(p)?)?
+      } else {
+        Default::default()
+      };
+      let mut files: Vec<Vec<u8>> = Vec::new();
+      for p in &input {
+        files.push(std::fs::read(p)?);
+      }
+      let bump = Bump::new();
+      let mut linker = GlobalLinker::new(
+        &bump,
+        GlobalLinkerConfig {
+          target_machine,
+          host_platform,
+        },
+      )?;
+      for (name, object) in input.iter().zip(files.iter()) {
+        linker.add_object(&name.to_string_lossy(), object)?;
+      }
+      linker.emit()?;
     }
   }
 
