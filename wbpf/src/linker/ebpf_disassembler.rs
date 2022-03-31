@@ -490,8 +490,17 @@ pub fn to_insn_vec(prog: &[u8]) -> Vec<HLInsn> {
 
       // BPF_JMP class
       ebpf::JA => {
-        name = "ja";
-        desc = format!("{} {:+#x}", name, insn.off);
+        name = match insn.src {
+          0 => "ja",
+          1 => "w_ret",
+          2 => "w_call",
+          _ => "ja?",
+        };
+        if insn.imm != 0 {
+          desc = format!("{} {:+} sp:{:+}", name, insn.off, insn.imm);
+        } else {
+          desc = format!("{} {:+}", name, insn.off);
+        }
       }
       ebpf::JEQ_IMM => {
         name = "jeq";
@@ -582,7 +591,11 @@ pub fn to_insn_vec(prog: &[u8]) -> Vec<HLInsn> {
         desc = jmp_reg_str(name, &insn);
       }
       ebpf::CALL => {
-        name = "call";
+        if insn.src == 1 {
+          name = "pseudo_call";
+        } else {
+          name = "call";
+        }
         desc = format!("{} {:#x}", name, insn.imm);
       }
       ebpf::TAIL_CALL => {

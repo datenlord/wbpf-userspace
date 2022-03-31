@@ -5,13 +5,12 @@ use std::{
 };
 
 use anyhow::Result;
-use bumpalo::Bump;
 use structopt::StructOpt;
 use wbpf::{
   device::Device,
   linker::{
-    global_linker::{GlobalLinker, GlobalLinkerConfig},
-    image::{HostPlatform, TargetMachine},
+    global_linker::{GlobalLinkerConfig},
+    image::{HostPlatform, TargetMachine}, fs::link_files,
   },
 };
 
@@ -99,11 +98,11 @@ enum Command {
     /// Input list.
     input: Vec<PathBuf>,
 
-    /// Target machine JSON config.
+    /// Target machine YAML/JSON config.
     #[structopt(long)]
     target_machine: Option<PathBuf>,
 
-    /// Host platform JSON config.
+    /// Host platform YAML/JSON config.
     #[structopt(long)]
     host_platform: Option<PathBuf>,
   },
@@ -187,31 +186,20 @@ fn main() -> Result<()> {
       host_platform,
     } => {
       let target_machine: TargetMachine = if let Some(p) = &target_machine {
-        serde_json::from_str(&std::fs::read_to_string(p)?)?
+        serde_yaml::from_str(&std::fs::read_to_string(p)?)?
       } else {
         Default::default()
       };
       let host_platform: HostPlatform = if let Some(p) = &host_platform {
-        serde_json::from_str(&std::fs::read_to_string(p)?)?
+        serde_yaml::from_str(&std::fs::read_to_string(p)?)?
       } else {
         Default::default()
       };
-      let mut files: Vec<Vec<u8>> = Vec::new();
-      for p in &input {
-        files.push(std::fs::read(p)?);
-      }
-      let bump = Bump::new();
-      let mut linker = GlobalLinker::new(
-        &bump,
-        GlobalLinkerConfig {
-          target_machine,
-          host_platform,
-        },
-      )?;
-      for (name, object) in input.iter().zip(files.iter()) {
-        linker.add_object(&name.to_string_lossy(), object)?;
-      }
-      linker.emit()?;
+      let config = GlobalLinkerConfig {
+        target_machine,
+        host_platform,
+      };
+      link_files(config, &input)?;
     }
   }
 
