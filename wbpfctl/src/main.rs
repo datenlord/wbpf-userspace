@@ -4,13 +4,19 @@ use std::{
   path::{Path, PathBuf},
 };
 
+use bytes::Buf;
+use serde::Deserialize;
+
 use anyhow::Result;
+use prost::Message;
 use structopt::StructOpt;
+use tokio::runtime::Handle;
 use wbpf::{
   device::Device,
   linker::{
-    global_linker::{GlobalLinkerConfig},
-    image::{HostPlatform, TargetMachine}, fs::link_files,
+    fs::link_files,
+    global_linker::GlobalLinkerConfig,
+    image::{HostPlatform, Image, TargetMachine},
   },
 };
 
@@ -93,10 +99,21 @@ enum Command {
     pc: u32,
   },
 
+  /// Read perf counters.
+  PerfCounters {
+    /// Processing element index.
+    #[structopt(long, default_value = "0")]
+    pe_index: u32,
+  },
+
   /// Link.
   Link {
     /// Input list.
     input: Vec<PathBuf>,
+
+    /// Output path.
+    #[structopt(long, short = "o")]
+    output: Option<PathBuf>,
 
     /// Target machine YAML/JSON config.
     #[structopt(long)]
@@ -106,15 +123,41 @@ enum Command {
     #[structopt(long)]
     host_platform: Option<PathBuf>,
   },
+
+  /// Load image.
+  LoadImage {
+    /// Input file.
+    #[structopt(long, short = "i")]
+    input: PathBuf,
+
+    /// Processing element index.
+    #[structopt(long, default_value = "0")]
+    pe_index: u32,
+
+    /// Path to machine state spec.
+    #[structopt(long)]
+    state: PathBuf,
+  },
 }
 
-fn main() -> Result<()> {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MachineState {
+  registers: Vec<i64>,
+  entry_point: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
   pretty_env_logger::init_timed();
   let opt = Opt::from_args();
 
   let open_device = || {
     if let Some(device) = &opt.device {
-      Device::open(&device).map_err(anyhow::Error::from)
+      tokio::task::block_in_place(move || {
+        Handle::current()
+          .block_on(async move { Device::open(&device).await.map_err(anyhow::Error::from) })
+      })
     } else {
       Err(anyhow::anyhow!("no device specified"))
     }
@@ -128,12 +171,8 @@ fn main() -> Result<()> {
       dma,
     } => {
       let device = open_device()?;
-      let mut f: Box<dyn Write> = if output.to_string_lossy() == "-" {
-        Box::new(stdout())
-      } else {
-        Box::new(OpenOptions::new().write(true).create(true).open(&output)?)
-      };
-      let device_dm = device.data_memory()?;
+      let mut f = open_output(&output)?;
+      let device_dm = device.data_memory().await?;
       let mut buffer = vec![0u8; size as usize];
 
       if dma {
@@ -149,7 +188,7 @@ fn main() -> Result<()> {
     Command::DmWrite { input, offset, dma } => {
       let device = open_device()?;
       let buf = read_input(&input)?;
-      let device_dm = device.data_memory()?;
+      let device_dm = device.data_memory().await?;
 
       if dma {
         device_dm.do_dma_write(offset, &buf)?;
@@ -180,8 +219,14 @@ fn main() -> Result<()> {
       device.start(pe_index, pc)?;
       log::info!("Started.");
     }
+    Command::PerfCounters { pe_index } => {
+      let device = open_device()?;
+      let perfctr = device.read_perf_counters(pe_index)?;
+      println!("{:?}", perfctr);
+    }
     Command::Link {
       input,
+      output,
       target_machine,
       host_platform,
     } => {
@@ -199,7 +244,59 @@ fn main() -> Result<()> {
         target_machine,
         host_platform,
       };
-      link_files(config, &input)?;
+      let image = link_files(config, &input)?;
+      if let Some(p) = &output {
+        let mut output = open_output(p)?;
+        output.write_all(&image.encode_to_vec())?;
+      }
+    }
+    Command::LoadImage {
+      input,
+      pe_index,
+      state,
+    } => {
+      let mut device = open_device()?;
+      let state: MachineState = serde_yaml::from_str(&std::fs::read_to_string(&state)?)?;
+      if state.registers.len() != 11 {
+        return Err(anyhow::anyhow!("invalid state"));
+      }
+      let image = read_input(&input)?;
+      device.stop(pe_index)?;
+      // FIXME: Race!
+      loop {
+        let es = device.read_exception_state().await?;
+        let es = &es[pe_index as usize];
+        if es.code != 7 {
+          continue;
+        }
+        break;
+      }
+
+      let image = Image::decode(image.as_slice())?;
+      device.load_image(pe_index, &image)?;
+
+      let offset_table = image
+        .offset_table
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no offset table"))?;
+
+      let offset = *offset_table
+        .func_offsets
+        .get(&state.entry_point)
+        .ok_or_else(|| anyhow::anyhow!("no entry point"))?;
+      let mut state_snapshot = [0u64; 11];
+      for i in 0..11 {
+        state_snapshot[i] = state.registers[i] as u64;
+      }
+      state_snapshot[10] = (state_snapshot[10] << 32) | (offset as u64);
+      let size = std::mem::size_of_val(&state_snapshot);
+      let dm = device.data_memory().await?;
+      dm.do_dma_write(0, unsafe {
+        std::slice::from_raw_parts(state_snapshot.as_ptr() as *const u8, size)
+      })?;
+      device.start(pe_index, 0)?;
+      log::info!("Start OK")
+      
     }
   }
 
@@ -215,4 +312,13 @@ fn read_input(input: &Path) -> Result<Vec<u8>> {
   let mut buf: Vec<u8> = Vec::new();
   f.read_to_end(&mut buf)?;
   Ok(buf)
+}
+
+fn open_output(output: &Path) -> Result<Box<dyn Write>> {
+  let mut f: Box<dyn Write> = if output.to_string_lossy() == "-" {
+    Box::new(stdout())
+  } else {
+    Box::new(OpenOptions::new().write(true).create(true).open(&output)?)
+  };
+  Ok(f)
 }

@@ -14,8 +14,8 @@ pub struct DataMemory {
 }
 
 impl DataMemory {
-  pub(crate) fn new(device: Device) -> Result<Self> {
-    let mem = MmapOptions::new().len(65536).map_raw(&*device.file)?;
+  pub(crate) async fn new(device: Device) -> Result<Self> {
+    let mem = MmapOptions::new().len(65536).map_raw(&*device.file.lock().await)?;
     Ok(DataMemory { device, mem })
   }
 
@@ -57,7 +57,7 @@ impl DataMemory {
       data_len: output_len as u32,
     };
     unsafe {
-      crate::uapi::ioc_read_dm(self.device.file.as_raw_fd(), &args)?;
+      crate::uapi::ioc_read_dm(self.device.file_fd, &args)?;
     }
     Ok(())
   }
@@ -71,7 +71,7 @@ impl DataMemory {
       data_len: data_len as u32,
     };
     unsafe {
-      crate::uapi::ioc_write_dm(self.device.file.as_raw_fd(), &args)?;
+      crate::uapi::ioc_write_dm(self.device.file_fd, &args)?;
     }
     Ok(())
   }

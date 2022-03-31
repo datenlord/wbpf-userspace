@@ -3,18 +3,10 @@ syntax = "proto3";
 package wbpf.linker.image;
 
 message Image {
-  Configuration conf = 1;
-}
-
-message Configuration {
-  HwRevision min_hw_revision = 1;
-  HwRevision max_hw_revision = 2;
-  int32 num_pe = 3;
-}
-
-message HwRevision {
-  int32 major = 1;
-  int32 minor = 2;
+  bytes code = 1;
+  TargetMachine machine = 2;
+  HostPlatform platform = 3;
+  OffsetTable offset_table = 4;
 }
 
 message TargetMachine {
@@ -23,4 +15,8 @@ message TargetMachine {
 
 message HostPlatform {
   map<string, int32> helpers = 1;
+}
+
+message OffsetTable {
+  map<string, int32> func_offsets = 1;
 }

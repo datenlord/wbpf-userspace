@@ -3,3 +3,4 @@ pub mod dm;
 pub mod linker;
 pub mod types;
 pub mod uapi;
+pub mod perf;

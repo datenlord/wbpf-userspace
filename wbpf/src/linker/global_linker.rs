@@ -11,8 +11,8 @@ use crate::{
 };
 
 use super::{
-  ebpf::{get_insn, Insn, EXIT, JA},
-  image::{HostPlatform, TargetMachine},
+  ebpf::{Insn, EXIT, JA, LD_DW_REG, MOV32_IMM},
+  image::{HostPlatform, OffsetTable, TargetMachine},
 };
 use super::{
   image::Image,
@@ -30,6 +30,7 @@ pub struct GlobalLinker<'a> {
   config: GlobalLinkerConfig,
   objects: Vec<LocalObject<'a>>,
   all_functions: FnvIndexMap<&'a str, (usize, usize)>, // name -> (obj_index, func_index)
+  offset_table: OffsetTable,
   image: Vec<u8>,
 }
 
@@ -40,6 +41,7 @@ impl<'a> GlobalLinker<'a> {
       config,
       objects: vec![],
       all_functions: Default::default(),
+      offset_table: Default::default(),
       image: vec![],
     })
   }
@@ -58,10 +60,39 @@ impl<'a> GlobalLinker<'a> {
   pub fn emit(&mut self) -> Result<Image> {
     self.populate_all_functions()?;
     self.resolve_pseudo_calls()?;
+    self.emit_entry_trampoline()?;
     self.emit_image()?;
     self.rewrite_image_call_return()?;
+    self.emit_offset_table()?;
     self.print_disassembly();
-    Ok(Image::default())
+    let mut image = Image::default();
+    image.code = std::mem::replace(&mut self.image, vec![]);
+    image.machine = Some(self.config.target_machine.clone());
+    image.platform = Some(self.config.host_platform.clone());
+    image.offset_table = Some(std::mem::replace(
+      &mut self.offset_table,
+      Default::default(),
+    ));
+    Ok(image)
+  }
+
+  fn emit_offset_table(&mut self) -> Result<()> {
+    let func_offsets = self
+      .all_functions
+      .values()
+      .map(|&(obj_index, func_index)| {
+        let object = &self.objects[obj_index];
+        let func = &object.functions[func_index];
+        (func.name, func.global_linked_offset)
+      })
+      .collect::<FnvIndexMap<_, _>>();
+    for (k, v) in func_offsets {
+      self
+        .offset_table
+        .func_offsets
+        .insert(k.to_string(), v as i32);
+    }
+    Ok(())
   }
 
   fn populate_all_functions(&mut self) -> Result<()> {
@@ -99,11 +130,12 @@ impl<'a> GlobalLinker<'a> {
       let elf = &*object.elf;
       let object_reloc = &mut object.reloc;
       let func = &mut object.functions[*func_index];
-      for (idx, insn) in func.code.iter_mut().enumerate() {
+      for insn in func.code.iter_mut() {
         if insn.insn.opc == CALL {
           // BPF_PSEUDO_CALL
           if insn.insn.src == 1 {
-            if let Some(reloc) = object_reloc.remove(&(*func_index, idx * 8)) {
+            if let Some(reloc) = object_reloc.remove(&(*func_index, insn.original_offset as usize))
+            {
               let sym = elf.syms.get_result(reloc.r_sym)?;
               let sym_name = elf.shdr_strtab.get_at_result(sym.st_name)?;
 
@@ -149,13 +181,23 @@ impl<'a> GlobalLinker<'a> {
                 }
               }
             } else {
-              let target_offset =
-                (func.offset as i32 + (idx as i32 + insn.insn.imm + 1) * 8) as usize;
+              assert!(insn.original_offset >= 0);
+              let target_offset = (func.offset as i32
+                + insn.original_offset as i32
+                + (insn.insn.imm + 1) * 8) as usize;
               let (name, target_function_index) = *function_map
                 .get(&(*obj_index, func.section_index))
                 .unwrap()
                 .get(&target_offset)
-                .ok_or_else(|| anyhow::anyhow!("missing function at target offset"))?;
+                .ok_or_else(|| {
+                  log::error!(
+                    "missing function at target offset - in {}:{}, insn offset {}",
+                    object.name,
+                    func.name,
+                    insn.original_offset
+                  );
+                  anyhow::anyhow!("missing function at target offset")
+                })?;
               insn.call_target_function = Some((*obj_index, target_function_index));
               log::debug!(
                 "resolved local pseudo call from {}:{} to {}",
@@ -169,6 +211,110 @@ impl<'a> GlobalLinker<'a> {
       }
     }
 
+    Ok(())
+  }
+
+  fn emit_entry_trampoline(&mut self) -> Result<()> {
+    let insns: Vec<Insn> = vec![
+      // Initialize constant
+      Insn {
+        opc: MOV32_IMM,
+        src: 0,
+        dst: 10,
+        off: 0,
+        imm: 0,
+      },
+      // Load registers 0-9
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 0,
+        off: 0,
+        imm: 0,
+      },
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 1,
+        off: 8,
+        imm: 0,
+      },
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 2,
+        off: 16,
+        imm: 0,
+      },
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 3,
+        off: 24,
+        imm: 0,
+      },
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 4,
+        off: 32,
+        imm: 0,
+      },
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 5,
+        off: 40,
+        imm: 0,
+      },
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 6,
+        off: 48,
+        imm: 0,
+      },
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 7,
+        off: 56,
+        imm: 0,
+      },
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 8,
+        off: 64,
+        imm: 0,
+      },
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 9,
+        off: 72,
+        imm: 0,
+      },
+      Insn {
+        opc: LD_DW_REG,
+        src: 10,
+        dst: 10,
+        off: 80,
+        imm: 0,
+      },
+      // RETURN
+      Insn {
+        opc: JA,
+        src: 1,
+        dst: 0,
+        off: 0,
+        imm: 0,
+      },
+    ];
+
+    self
+      .image
+      .extend(insns.iter().map(|x| x.to_array().into_iter()).flatten());
     Ok(())
   }
 
@@ -208,7 +354,7 @@ impl<'a> GlobalLinker<'a> {
       if let Some((obj_index, func_index)) = offset_to_func.get(&off) {
         let object = &self.objects[*obj_index];
         let func = &object.functions[*func_index];
-        println!("\n<{}:{}>:", object.name, func.name);
+        log::info!("\n<{}:{}>:", object.name, func.name);
       }
       let insn_len = if self.image[off] == LD_DW_IMM {
         16usize
@@ -219,7 +365,7 @@ impl<'a> GlobalLinker<'a> {
         .into_iter()
         .next()
         .unwrap();
-      println!("\t{}", insn.desc);
+      log::info!("\t{}", insn.desc);
       off += insn_len;
     }
   }
@@ -260,7 +406,7 @@ impl<'a> GlobalLinker<'a> {
             dst: 0,
             src: 2,
             off: diff,
-            imm: -((call_target_function_body.stack_usage + 8) as i32),
+            imm: -((func.stack_usage + 8) as i32),
           };
           self.image[this_offset as usize..(this_offset + 8) as usize]
             .copy_from_slice(&ja_insn.to_array());
@@ -280,7 +426,7 @@ impl<'a> GlobalLinker<'a> {
             dst: 0,
             src: 1,
             off: 0,
-            imm: (func.stack_usage + 8) as i32,
+            imm: 0,
           };
           self.image[this_offset as usize..(this_offset + 8) as usize]
             .copy_from_slice(&ja_insn.to_array());

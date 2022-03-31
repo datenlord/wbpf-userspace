@@ -17,7 +17,7 @@ use heapless::Vec as HVec;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use super::ebpf::{Insn, BPF_ST, BPF_STX};
+use super::ebpf::{Insn, ADD64_IMM, BPF_ST, BPF_STX, LD_DW_REG, ST_DW_REG, SUB64_IMM};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct LocalLinkerConfig {}
@@ -40,23 +40,19 @@ pub struct Function<'a> {
   pub name: &'a str,
   pub section_index: usize,
   pub offset: usize,
+  pub end_offset: usize,
+  pub raw_code: Vec<Insn>,
   pub code: Vec<AnnotatedInsn>,
   pub global: bool,
   pub stack_usage: usize,
   pub global_linked_offset: usize,
 }
 
-impl<'a> Function<'a> {
-  pub fn end_offset(&self) -> usize {
-    self.offset + self.code.len() * 8
-  }
-}
-
 #[derive(Clone)]
 pub struct AnnotatedInsn {
   pub insn: Insn,
+  pub original_offset: isize,
   pub call_target_function: Option<(usize, usize)>, // (object_index, func_index)
-  pub sp_adjustment: i32,
 }
 
 impl LocalLinker {
@@ -85,6 +81,7 @@ impl LocalLinker {
     obj.populate_functions(bump)?;
     obj.populate_reloc()?;
     obj.calculate_stack_usage()?;
+    obj.patch_callee_saved_regs()?;
     Ok(obj)
   }
 }
@@ -127,14 +124,15 @@ impl<'a> LocalObject<'a> {
         let insn = get_insn(&subslice, i);
         let annotated = AnnotatedInsn {
           insn,
+          original_offset: (i * 8) as isize,
           call_target_function: None,
-          sp_adjustment: 0,
         };
         func.code.push(annotated);
       }
 
       func.section_index = sym.st_shndx;
       func.offset = sym.st_value as usize;
+      func.end_offset = func.offset + subslice.len();
 
       self.functions.insert(name, func);
     }
@@ -163,7 +161,7 @@ impl<'a> LocalObject<'a> {
           .rev()
           .next()
           .and_then(|x| {
-            if self.functions[*x.1].end_offset() > reloc.r_offset as usize {
+            if self.functions[*x.1].end_offset > reloc.r_offset as usize {
               Some(*x.1)
             } else {
               None
@@ -224,6 +222,91 @@ impl<'a> LocalObject<'a> {
         stack_usage
       );
     }
+    Ok(())
+  }
+
+  fn patch_callee_saved_regs(&mut self) -> Result<()> {
+    for (_, func) in &mut self.functions {
+      let mut need_save = [false, false, false, false];
+      if func.code.last().map(|x| x.insn.opc) != Some(EXIT) {
+        log::warn!(
+          "function {}:{} does not end with exit instruction, skipping patch callee-saved registers",
+          self.name,
+          func.name
+        );
+        continue;
+      }
+      for insn in &func.code {
+        if insn.insn.dst >= 6 && insn.insn.dst <= 9 {
+          need_save[insn.insn.dst as usize - 6] = true;
+        }
+      }
+
+      let mut count = 0usize;
+      let mut prepend: Vec<AnnotatedInsn> = vec![];
+      let mut append: Vec<AnnotatedInsn> = vec![];
+      for (i, &need_save) in need_save.iter().enumerate() {
+        let i = i + 6;
+        if need_save {
+          prepend.push(AnnotatedInsn {
+            insn: Insn {
+              opc: ST_DW_REG,
+              dst: 10,
+              src: i as _,
+              off: (count * 8) as _,
+              imm: 0,
+            },
+            original_offset: -1,
+            call_target_function: None,
+          });
+          append.push(AnnotatedInsn {
+            insn: Insn {
+              opc: LD_DW_REG,
+              dst: i as _,
+              src: 10,
+              off: (count * 8) as _,
+              imm: 0,
+            },
+            original_offset: -1,
+            call_target_function: None,
+          });
+          count += 1;
+        }
+      }
+
+      // Callee-saved-regs area does not count towards stack usage since it is above the function stack.
+      if count != 0 {
+        let exit = func.code.pop().unwrap();
+        func.code = std::iter::once(AnnotatedInsn {
+          insn: Insn {
+            opc: SUB64_IMM,
+            dst: 10,
+            src: 0,
+            off: 0,
+            imm: (count * 8) as _,
+          },
+          original_offset: -1,
+          call_target_function: None,
+        })
+        .chain(prepend.into_iter())
+        .chain(std::mem::replace(&mut func.code, vec![]).into_iter())
+        .chain(append.into_iter())
+        .chain(std::iter::once(AnnotatedInsn {
+          insn: Insn {
+            opc: ADD64_IMM,
+            dst: 10,
+            src: 0,
+            off: 0,
+            imm: (count * 8) as _,
+          },
+          original_offset: -1,
+          call_target_function: None,
+        }))
+        .chain(std::iter::once(exit))
+        .collect();
+      }
+    }
+
     Ok(())
   }
 }

@@ -5,7 +5,9 @@ use bumpalo::Bump;
 
 use crate::linker::global_linker::{GlobalLinker, GlobalLinkerConfig};
 
-pub fn link_files<S: AsRef<Path>>(config: GlobalLinkerConfig, input: &[S]) -> Result<()> {
+use super::image::Image;
+
+pub fn link_files<S: AsRef<Path>>(config: GlobalLinkerConfig, input: &[S]) -> Result<Image> {
   let input = input
     .iter()
     .map(|x| {
@@ -26,6 +28,5 @@ pub fn link_files<S: AsRef<Path>>(config: GlobalLinkerConfig, input: &[S]) -> Re
   for (name, object) in input.iter().zip(files.iter()) {
     linker.add_object(&name.to_string_lossy(), object)?;
   }
-  linker.emit()?;
-  Ok(())
+  Ok(linker.emit()?)
 }
