@@ -1,0 +1,2 @@
+registers: [0, 420, 15, 0x100, 0x108, 0x110, 0, 0, 0, 0, 0x20000]
+entryPoint: mul_div_u
