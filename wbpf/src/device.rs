@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::Result;
 use nix::fcntl;
+use serde::{Deserialize, Serialize};
 use tokio::{io::unix::AsyncFd, sync::Mutex};
 
 use crate::{
@@ -35,6 +36,13 @@ pub struct ExceptionState {
   pub data: u64,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineState {
+  pub registers: Vec<i64>,
+  pub entry_point: String,
+}
+
 impl Device {
   pub async fn open(path: &Path) -> Result<Self> {
     let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -55,7 +63,7 @@ impl Device {
     Ok(dev)
   }
 
-  pub async fn read_exception_state(&mut self) -> Result<Vec<ExceptionState>> {
+  pub async fn read_exception_state(&self) -> Result<Vec<ExceptionState>> {
     let mut buf = vec![wbpf_uapi_pe_exception_state::default(); self.num_pe as usize];
     let buf_size = std::mem::size_of::<wbpf_uapi_pe_exception_state>() * self.num_pe as usize;
     let file = self.file.lock().await;
@@ -125,6 +133,21 @@ impl Device {
     Ok(())
   }
 
+  pub async fn stop_and_wait(&self, pe_index: u32) -> Result<()> {
+    self.stop(pe_index)?;
+
+    loop {
+      let es = self.read_exception_state().await?;
+      let es = &es[pe_index as usize];
+
+      // STOP | INTR
+      if es.code == 0x80000007u32 {
+        break;
+      }
+    }
+    Ok(())
+  }
+
   pub fn start(&self, pe_index: u32, pc: u32) -> Result<()> {
     let args = wbpf_uapi_start_args { pe_index, pc };
     unsafe {
@@ -151,6 +174,49 @@ impl Device {
 
   pub fn load_image(&self, pe_index: u32, image: &Image) -> Result<()> {
     self.load_code(pe_index, 0, &image.code)?;
+    Ok(())
+  }
+
+  pub async fn run(&self, image: &Image, state: &MachineState, pe_index: u32) -> Result<()> {
+    self.stop_and_wait(pe_index).await?;
+    self.load_image(pe_index, &image)?;
+
+    let offset_table = image
+      .offset_table
+      .as_ref()
+      .ok_or_else(|| anyhow::anyhow!("no offset table"))?;
+
+    let offset = *offset_table
+      .func_offsets
+      .get(&state.entry_point)
+      .ok_or_else(|| anyhow::anyhow!("no entry point"))?;
+    let mut state_snapshot = [0u64; 11];
+    for i in 0..11 {
+      state_snapshot[i] = state.registers[i] as u64;
+    }
+    state_snapshot[10] = (state_snapshot[10] << 32) | (offset as u64);
+    let size = std::mem::size_of_val(&state_snapshot);
+    let dm = self.data_memory().await?;
+    dm.do_dma_write(0, unsafe {
+      std::slice::from_raw_parts(state_snapshot.as_ptr() as *const u8, size)
+    })?;
+    let start_perfctr = self.read_perf_counters(pe_index)?;
+    self.start(pe_index, 0)?;
+    let es = loop {
+      let es = self.read_exception_state().await?;
+      let es = es.into_iter().nth(pe_index as usize).unwrap();
+      if es.code & 0x80000000u32 != 0 {
+        break es;
+      }
+    };
+    let end_perfctr = self.read_perf_counters(pe_index)?;
+    println!("new es: {:?}", es);
+    println!(
+      "cycles={} commits={}",
+      end_perfctr.cycles - start_perfctr.cycles,
+      end_perfctr.commits - start_perfctr.commits
+    );
+
     Ok(())
   }
 }

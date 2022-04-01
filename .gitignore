@@ -1,4 +1,6 @@
 target/
 *.o
 /*.img
-/log
+log
+*.dump
+*.info

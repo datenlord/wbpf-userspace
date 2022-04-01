@@ -1,6 +1,10 @@
 use anyhow::Result;
 use bumpalo::Bump;
 use fnv::{FnvHashMap, FnvHashSet};
+use goblin::elf64::{
+  section_header::{SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS},
+  sym::STB_LOCAL,
+};
 use petgraph::{
   graph::{DiGraph, NodeIndex},
   visit::{Dfs, Visitable},
@@ -16,6 +20,7 @@ use crate::{
 };
 
 use super::{
+  consts::{R_BPF_64_32, R_BPF_64_64},
   ebpf::{Insn, ADD64_IMM, EXIT, JA, LD_DW_REG, MOV32_IMM},
   image::{HostPlatform, OffsetTable, TargetMachine},
 };
@@ -35,9 +40,11 @@ pub struct GlobalLinker<'a> {
   bump: &'a Bump,
   config: GlobalLinkerConfig,
   objects: Vec<LocalObject<'a>>,
-  all_functions: FnvIndexMap<&'a str, (usize, usize)>, // name -> (obj_index, func_index)
+  all_functions: FnvIndexMap<String, (usize, usize)>, // name -> (obj_index, func_index)
   offset_table: OffsetTable,
-  image: Vec<u8>,
+  code_image: Vec<u8>,
+  data_image: Vec<u8>,
+  data_section_to_offset: FnvHashMap<(u32, u32), u32>, // (obj_index, section_index) -> offset
 }
 
 impl<'a> GlobalLinker<'a> {
@@ -48,7 +55,9 @@ impl<'a> GlobalLinker<'a> {
       objects: vec![],
       all_functions: Default::default(),
       offset_table: Default::default(),
-      image: vec![],
+      code_image: vec![],
+      data_image: vec![],
+      data_section_to_offset: Default::default(),
     })
   }
 
@@ -64,19 +73,22 @@ impl<'a> GlobalLinker<'a> {
   }
 
   pub fn emit(&mut self) -> Result<Image> {
+    self.emit_data()?;
     self.populate_all_functions()?;
     self.resolve_pseudo_calls()?;
+    self.resolve_generic_relocs()?;
 
     if let Some(dce_roots) = self.config.dce_roots.clone() {
       self.global_dce(&dce_roots)?;
     }
 
     self.emit_entry_trampoline()?;
-    self.emit_image()?;
+    self.emit_code_image()?;
     self.rewrite_image_call_return()?;
     self.emit_offset_table()?;
     let mut image = Image::default();
-    image.code = std::mem::replace(&mut self.image, vec![]);
+    image.code = std::mem::replace(&mut self.code_image, vec![]);
+    image.data = std::mem::replace(&mut self.data_image, vec![]);
     image.machine = Some(self.config.target_machine.clone());
     image.platform = Some(self.config.host_platform.clone());
     image.offset_table = Some(std::mem::replace(
@@ -107,8 +119,13 @@ impl<'a> GlobalLinker<'a> {
 
   fn populate_all_functions(&mut self) -> Result<()> {
     for (obj_idx, obj) in self.objects.iter().enumerate() {
-      for (func_idx, (func_name, _)) in obj.functions.iter().enumerate() {
-        if let Some((obj_index, _)) = self.all_functions.get(func_name) {
+      for (func_idx, (func_name, func)) in obj.functions.iter().enumerate() {
+        let func_name = if func.global {
+          func_name.to_string()
+        } else {
+          format!("{}:{}", obj.name, func_name)
+        };
+        if let Some((obj_index, _)) = self.all_functions.get(&func_name) {
           return Err(anyhow::anyhow!(
             "multiple definitions of function {} in {} and {}",
             func_name,
@@ -117,6 +134,87 @@ impl<'a> GlobalLinker<'a> {
           ));
         }
         self.all_functions.insert(func_name, (obj_idx, func_idx));
+      }
+    }
+    Ok(())
+  }
+
+  fn emit_data(&mut self) -> Result<()> {
+    for (obj_idx, object) in self.objects.iter().enumerate() {
+      let elf = &*object.elf;
+      for (section_index, shdr) in elf.section_headers.iter().enumerate() {
+        if shdr.sh_type == SHT_PROGBITS
+          && (shdr.sh_flags & SHF_ALLOC as u64) != 0
+          && (shdr.sh_flags & SHF_EXECINSTR as u64) == 0
+        {
+          let data_offset = self.data_image.len();
+          let file_range = shdr
+            .file_range()
+            .ok_or_else(|| anyhow::anyhow!("missing file range"))?;
+          let data = object
+            .raw
+            .get(file_range)
+            .ok_or_else(|| anyhow::anyhow!("file range out of bounds"))?;
+          self.data_image.extend_from_slice(data);
+          self.data_section_to_offset.insert(
+            (obj_idx as u32, section_index as u32),
+            data_offset as u32 + self.config.host_platform.data_offset as u32,
+          );
+        }
+      }
+    }
+    Ok(())
+  }
+
+  fn resolve_generic_relocs(&mut self) -> Result<()> {
+    for (object_index, object) in self.objects.iter_mut().enumerate() {
+      let object_reloc = &mut object.reloc;
+      let elf = &*object.elf;
+      for (&(func_index, offset_in_func), reloc) in &*object_reloc {
+        let sym = elf.syms.get_result(reloc.r_sym)?;
+        let sym_name = elf.shdr_strtab.get_at_result(sym.st_name)?;
+        if sym.st_bind() != STB_LOCAL {
+          anyhow::bail!(
+            "non-local data relocation is not supported: object {}, symbol {}",
+            object.name,
+            sym_name
+          );
+        }
+        let data_base_offset = *self
+          .data_section_to_offset
+          .get(&(object_index as u32, sym.st_shndx as u32))
+          .ok_or_else(|| anyhow::anyhow!("data offset not found"))?;
+        let this_offset = data_base_offset + sym.st_value as u32;
+        let func = &mut object.functions[func_index];
+
+        if reloc.r_type == R_BPF_64_64 {
+          let this_insn_index = offset_in_func / 8;
+          let next_insn_index = this_insn_index + 1;
+          let value = (func.code[this_insn_index].insn.imm as u64)
+            | ((func.code[next_insn_index].insn.imm as u64) << 32);
+          let value = value + this_offset as u64;
+          func.code[this_insn_index].insn.imm = value as i32;
+          func.code[next_insn_index].insn.imm = (value >> 32) as i32;
+        } else if reloc.r_type == R_BPF_64_32 {
+          let this_insn_index = offset_in_func / 8;
+          let value = func.code[this_insn_index].insn.imm;
+          func.code[this_insn_index].insn.imm = value + this_offset as i32;
+        } else {
+          anyhow::bail!(
+            "unsupported relocation type: {}, object {}, symbol {}",
+            reloc.r_type,
+            object.name,
+            sym_name
+          );
+        }
+        log::debug!(
+          "resolved generic data relocation: object {}, func {}, offset {}, target base {}, symbol {}",
+          object.name,
+          func.name,
+          offset_in_func,
+          data_base_offset,
+          sym_name
+        );
       }
     }
     Ok(())
@@ -131,7 +229,7 @@ impl<'a> GlobalLinker<'a> {
       function_map
         .entry((*obj_index, func.section_index))
         .or_default()
-        .insert(func.offset, (*name, *func_index));
+        .insert(func.offset, (name.as_str(), *func_index));
     }
 
     let objects_snapshot = self.objects.clone();
@@ -149,7 +247,13 @@ impl<'a> GlobalLinker<'a> {
               let sym = elf.syms.get_result(reloc.r_sym)?;
               let sym_name = elf.shdr_strtab.get_at_result(sym.st_name)?;
 
-              if let Some(&(obj_index, func_index)) = self.all_functions.get(sym_name) {
+              if let Some(&(obj_index, func_index)) =
+                self.all_functions.get(sym_name).or_else(|| {
+                  self
+                    .all_functions
+                    .get(&format!("{}:{}", object.name, sym_name))
+                })
+              {
                 insn.call_target_function = Some((obj_index, func_index));
                 let target_object = &objects_snapshot[obj_index];
                 let target_func = &target_object.functions[func_index];
@@ -323,16 +427,16 @@ impl<'a> GlobalLinker<'a> {
     ];
 
     self
-      .image
+      .code_image
       .extend(insns.iter().map(|x| x.to_array().into_iter()).flatten());
     Ok(())
   }
 
-  fn emit_image(&mut self) -> Result<()> {
+  fn emit_code_image(&mut self) -> Result<()> {
     for &(obj_index, func_index) in self.all_functions.values() {
       let object = &mut self.objects[obj_index];
       let func = &mut object.functions[func_index];
-      func.global_linked_offset = self.image.len();
+      func.global_linked_offset = self.code_image.len();
       log::debug!(
         "emitting function {}:{} at {} len {}",
         object.name,
@@ -342,7 +446,7 @@ impl<'a> GlobalLinker<'a> {
       );
 
       for insn in &func.code {
-        self.image.extend_from_slice(&insn.insn.to_array());
+        self.code_image.extend_from_slice(&insn.insn.to_array());
       }
     }
 
@@ -387,7 +491,7 @@ impl<'a> GlobalLinker<'a> {
             off: diff,
             imm: -((func.stack_usage + 8) as i32),
           };
-          self.image[this_offset as usize..(this_offset + 8) as usize]
+          self.code_image[this_offset as usize..(this_offset + 8) as usize]
             .copy_from_slice(&ja_insn.to_array());
           log::debug!(
             "rewritten call from {}:{} to {}:{} at insn index {}",
@@ -407,7 +511,7 @@ impl<'a> GlobalLinker<'a> {
             off: 0,
             imm: 0,
           };
-          self.image[this_offset as usize..(this_offset + 8) as usize]
+          self.code_image[this_offset as usize..(this_offset + 8) as usize]
             .copy_from_slice(&ja_insn.to_array());
           log::debug!(
             "rewritten exit in {}:{} at insn index {}",
@@ -430,7 +534,7 @@ impl<'a> GlobalLinker<'a> {
       .all_functions
       .keys()
       .enumerate()
-      .filter(|x| roots.contains(x.1))
+      .filter(|x| roots.contains(x.1.as_str()))
       .map(|x| NodeIndex::new(x.0))
       .collect::<Vec<_>>();
     let fn_to_index = self
@@ -468,7 +572,7 @@ impl<'a> GlobalLinker<'a> {
         }
       })
       .map(|x| x.1)
-      .collect::<FnvIndexMap<&'a str, (usize, usize)>>();
+      .collect::<FnvIndexMap<String, (usize, usize)>>();
     self.all_functions = all_functions;
     Ok(())
   }

@@ -4,14 +4,12 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
-
 use anyhow::Result;
 use prost::Message;
 use structopt::StructOpt;
 use tokio::runtime::Handle;
 use wbpf::{
-  device::Device,
+  device::{Device, MachineState},
   linker::{
     fs::link_files,
     global_linker::GlobalLinkerConfig,
@@ -155,13 +153,6 @@ enum Command {
   },
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MachineState {
-  registers: Vec<i64>,
-  entry_point: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
   pretty_env_logger::init_timed();
@@ -272,7 +263,7 @@ async fn main() -> Result<()> {
       pe_index,
       state,
     } => {
-      let mut device = open_device()?;
+      let device = open_device()?;
       let state: MachineState = serde_yaml::from_str(&std::fs::read_to_string(&state)?)?;
       if state.registers.len() != 11 {
         return Err(anyhow::anyhow!("invalid state"));
@@ -321,7 +312,11 @@ async fn main() -> Result<()> {
       };
       let end_perfctr = device.read_perf_counters(pe_index)?;
       println!("new es: {:?}", es);
-      println!("cycles={} commits={}", end_perfctr.cycles - start_perfctr.cycles, end_perfctr.commits - start_perfctr.commits);
+      println!(
+        "cycles={} commits={}",
+        end_perfctr.cycles - start_perfctr.cycles,
+        end_perfctr.commits - start_perfctr.commits
+      );
     }
     Command::DisassembleImage { input, binary } => {
       let image = read_input(&input)?;

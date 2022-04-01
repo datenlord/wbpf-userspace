@@ -1,12 +1,11 @@
 #include <stdint.h>
 
-long callByName(const char *name);
 int extAdd(int a, int b);
 
 static uint64_t data[] = {0x1111, 0x2222, 0x99};
 
 long entry() {
-    return callByName("test") + callByName("test2") + 1;
+    return 1 + 1;
 }
 
 void set_data(int index, uint64_t value) {

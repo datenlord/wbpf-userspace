@@ -7,6 +7,7 @@ message Image {
   TargetMachine machine = 2;
   HostPlatform platform = 3;
   OffsetTable offset_table = 4;
+  bytes data = 5;
 }
 
 message TargetMachine {
@@ -15,6 +16,7 @@ message TargetMachine {
 
 message HostPlatform {
   map<string, int32> helpers = 1;
+  int32 data_offset = 2;
 }
 
 message OffsetTable {

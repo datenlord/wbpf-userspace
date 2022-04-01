@@ -1,0 +1,2 @@
+registers: [0, 0x100, 100, 0x200, 0x220, 0, 0, 0, 0, 0, 0x20000]
+entryPoint: do_encrypt
