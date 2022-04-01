@@ -993,6 +993,7 @@ dependencies = [
  "log",
  "memmap2",
  "nix",
+ "petgraph",
  "prost",
  "prost-build",
  "prost-types",

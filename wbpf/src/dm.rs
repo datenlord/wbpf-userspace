@@ -13,7 +13,9 @@ pub struct DataMemory {
 
 impl DataMemory {
   pub(crate) async fn new(device: Device) -> Result<Self> {
-    let mem = MmapOptions::new().len(65536).map_raw(&*device.file.lock().await)?;
+    let mem = MmapOptions::new()
+      .len(65536)
+      .map_raw(&*device.file.lock().await)?;
     Ok(DataMemory { device, mem })
   }
 

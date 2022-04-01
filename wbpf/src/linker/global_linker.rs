@@ -1,5 +1,10 @@
 use anyhow::Result;
 use bumpalo::Bump;
+use fnv::{FnvHashMap, FnvHashSet};
+use petgraph::{
+  graph::{DiGraph, NodeIndex},
+  visit::{Dfs, Visitable},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -11,7 +16,7 @@ use crate::{
 };
 
 use super::{
-  ebpf::{Insn, EXIT, JA, LD_DW_REG, MOV32_IMM, ADD64_IMM},
+  ebpf::{Insn, ADD64_IMM, EXIT, JA, LD_DW_REG, MOV32_IMM},
   image::{HostPlatform, OffsetTable, TargetMachine},
 };
 use super::{
@@ -23,6 +28,7 @@ use super::{
 pub struct GlobalLinkerConfig {
   pub target_machine: TargetMachine,
   pub host_platform: HostPlatform,
+  pub dce_roots: Option<Vec<String>>,
 }
 
 pub struct GlobalLinker<'a> {
@@ -60,6 +66,11 @@ impl<'a> GlobalLinker<'a> {
   pub fn emit(&mut self) -> Result<Image> {
     self.populate_all_functions()?;
     self.resolve_pseudo_calls()?;
+
+    if let Some(dce_roots) = self.config.dce_roots.clone() {
+      self.global_dce(&dce_roots)?;
+    }
+
     self.emit_entry_trampoline()?;
     self.emit_image()?;
     self.rewrite_image_call_return()?;
@@ -407,6 +418,58 @@ impl<'a> GlobalLinker<'a> {
         }
       }
     }
+    Ok(())
+  }
+
+  fn global_dce<S: AsRef<str>>(&mut self, roots: &[S]) -> Result<()> {
+    let roots = roots
+      .iter()
+      .map(|x| x.as_ref())
+      .collect::<FnvHashSet<&str>>();
+    let root_indices = self
+      .all_functions
+      .keys()
+      .enumerate()
+      .filter(|x| roots.contains(x.1))
+      .map(|x| NodeIndex::new(x.0))
+      .collect::<Vec<_>>();
+    let fn_to_index = self
+      .all_functions
+      .values()
+      .enumerate()
+      .map(|(k, v)| (*v, k))
+      .collect::<FnvHashMap<_, _>>();
+
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    for (i, &(obj_index, func_index)) in self.all_functions.values().enumerate() {
+      let object = &self.objects[obj_index];
+      let func = &object.functions[func_index];
+      for insn in func.code.iter() {
+        if let Some(target) = insn.call_target_function {
+          edges.push((i as u32, fn_to_index[&target] as u32));
+        }
+      }
+    }
+    let g = DiGraph::<(), ()>::from_edges(edges.iter().copied());
+    let mut dfs = Dfs::from_parts(root_indices, g.visit_map());
+    let mut unused_functions = (0..self.all_functions.len()).collect::<FnvHashSet<_>>();
+    while let Some(n) = dfs.next(&g) {
+      unused_functions.remove(&n.index());
+    }
+    let all_functions = std::mem::replace(&mut self.all_functions, Default::default())
+      .into_iter()
+      .enumerate()
+      .filter(|x| {
+        if unused_functions.contains(&x.0) {
+          log::debug!("removing unused function {}", x.1 .0);
+          false
+        } else {
+          true
+        }
+      })
+      .map(|x| x.1)
+      .collect::<FnvIndexMap<&'a str, (usize, usize)>>();
+    self.all_functions = all_functions;
     Ok(())
   }
 }
