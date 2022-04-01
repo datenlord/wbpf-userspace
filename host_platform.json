@@ -1,5 +1,5 @@
 {
   "helpers": {
-    "callByName": 1000
+    "wbpf_host_complete": 1024
   }
 }

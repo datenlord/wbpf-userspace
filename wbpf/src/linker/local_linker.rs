@@ -13,8 +13,6 @@ use goblin::{
   elf::{Elf, Reloc},
   elf64::{header::EM_BPF, sym::STB_GLOBAL},
 };
-use heapless::Vec as HVec;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use super::ebpf::{Insn, ADD64_IMM, BPF_ST, BPF_STX, LD_DW_REG, ST_DW_REG, SUB64_IMM};
@@ -88,10 +86,23 @@ impl LocalLinker {
 
 impl<'a> LocalObject<'a> {
   fn populate_functions(&mut self, _bump: &'a Bump) -> Result<()> {
-    for sym in self.elf.syms.iter() {
-      if !sym.is_function() {
-        continue;
-      }
+    let func_syms = self
+      .elf
+      .syms
+      .iter()
+      .filter(|x| x.is_function())
+      .collect::<Vec<_>>();
+    let mut section_function_offsets: FnvIndexMap<usize, Vec<usize>> = Default::default();
+    for &sym in &func_syms {
+      section_function_offsets
+        .entry(sym.st_shndx)
+        .or_default()
+        .push(sym.st_value as usize);
+    }
+    for v in section_function_offsets.values_mut() {
+      v.sort();
+    }
+    for &sym in &func_syms {
       let name = self.elf.shdr_strtab.get_at_result(sym.st_name)?;
       let mut func = Function::default();
       func.global = sym.st_bind() == STB_GLOBAL;
@@ -105,20 +116,19 @@ impl<'a> LocalObject<'a> {
         .raw
         .get(file_range)
         .ok_or_else(|| anyhow::anyhow!("file range out of bounds"))?;
+      let this_section_function_offsets = section_function_offsets.get(&sym.st_shndx).unwrap();
+      let end_index: Result<usize, ()> = this_section_function_offsets
+        .binary_search(&(sym.st_value as usize + 1))
+        .or_else(|x| Ok(x));
+      let end_index = end_index.unwrap();
+      let end_offset = if end_index == this_section_function_offsets.len() {
+        prog.len() as usize
+      } else {
+        this_section_function_offsets[end_index]
+      };
       let subslice = prog
-        .get(sym.st_value as usize..)
+        .get(sym.st_value as usize..end_offset)
         .ok_or_else(|| anyhow::anyhow!("function out of range"))?;
-      let subslice = subslice
-        .iter()
-        .chunks(8)
-        .into_iter()
-        .map(|x| x.into_iter().copied().collect::<HVec<u8, 8>>())
-        .take_while(|x| x.len() == 8 && get_insn(x, 0).opc != EXIT)
-        .chain(std::iter::once(
-          HVec::<u8, 8>::from_slice(&[0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).unwrap(),
-        )) // exit
-        .flatten()
-        .collect::<Vec<_>>();
 
       for i in 0..subslice.len() / 8 {
         let insn = get_insn(&subslice, i);

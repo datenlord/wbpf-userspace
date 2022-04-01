@@ -4,7 +4,6 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use bytes::Buf;
 use serde::Deserialize;
 
 use anyhow::Result;
@@ -17,6 +16,7 @@ use wbpf::{
     fs::link_files,
     global_linker::GlobalLinkerConfig,
     image::{HostPlatform, Image, TargetMachine},
+    image_disassembler::DisassembledImage,
   },
 };
 
@@ -137,6 +137,17 @@ enum Command {
     /// Path to machine state spec.
     #[structopt(long)]
     state: PathBuf,
+  },
+
+  /// Disassemble image.
+  DisassembleImage {
+    /// Input file.
+    #[structopt(long, short = "i")]
+    input: PathBuf,
+
+    /// Binary output?
+    #[structopt(long)]
+    binary: bool,
   },
 }
 
@@ -262,16 +273,8 @@ async fn main() -> Result<()> {
       }
       let image = read_input(&input)?;
       device.stop(pe_index)?;
-      // FIXME: Race!
-      loop {
-        let es = device.read_exception_state().await?;
-        let es = &es[pe_index as usize];
-        if es.code != 7 {
-          continue;
-        }
-        break;
-      }
-
+      let es = device.read_exception_state().await?;
+      log::info!("stop ok");
       let image = Image::decode(image.as_slice())?;
       device.load_image(pe_index, &image)?;
 
@@ -295,8 +298,24 @@ async fn main() -> Result<()> {
         std::slice::from_raw_parts(state_snapshot.as_ptr() as *const u8, size)
       })?;
       device.start(pe_index, 0)?;
-      log::info!("Start OK")
-      
+      log::info!("Start OK");
+      let es = device.read_exception_state().await?;
+      println!("new es: {:?}", es[pe_index as usize]);
+    }
+    Command::DisassembleImage { input, binary } => {
+      let image = read_input(&input)?;
+      let image = Image::decode(image.as_slice())?;
+      if binary {
+        for (i, byte) in image.code.iter().enumerate() {
+          if i + 1 == image.code.len() {
+            println!("0x{:02x}", byte);
+          } else {
+            print!("0x{:02x}, ", byte);
+          }
+        }
+      } else {
+        println!("{}", DisassembledImage::new(&image));
+      }
     }
   }
 
@@ -315,10 +334,16 @@ fn read_input(input: &Path) -> Result<Vec<u8>> {
 }
 
 fn open_output(output: &Path) -> Result<Box<dyn Write>> {
-  let mut f: Box<dyn Write> = if output.to_string_lossy() == "-" {
+  let f: Box<dyn Write> = if output.to_string_lossy() == "-" {
     Box::new(stdout())
   } else {
-    Box::new(OpenOptions::new().write(true).create(true).open(&output)?)
+    Box::new(
+      OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output)?,
+    )
   };
   Ok(f)
 }

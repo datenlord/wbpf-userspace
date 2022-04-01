@@ -1,5 +1,5 @@
 {
   "helpers": {
-    "getCoreIndex": 1
+    "wbpf_machine_get_core_index": 1
   }
 }

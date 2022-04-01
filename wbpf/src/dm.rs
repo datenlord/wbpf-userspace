@@ -1,5 +1,3 @@
-use std::os::unix::prelude::AsRawFd;
-
 use anyhow::Result;
 use memmap2::{MmapOptions, MmapRaw};
 

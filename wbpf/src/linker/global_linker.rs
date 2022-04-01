@@ -4,14 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
   linker::{
-    ebpf::{CALL, LD_DW_IMM},
+    ebpf::CALL,
     elf_ext::{StrtabExt, SymtabExt},
   },
   types::FnvIndexMap,
 };
 
 use super::{
-  ebpf::{Insn, EXIT, JA, LD_DW_REG, MOV32_IMM},
+  ebpf::{Insn, EXIT, JA, LD_DW_REG, MOV32_IMM, ADD64_IMM},
   image::{HostPlatform, OffsetTable, TargetMachine},
 };
 use super::{
@@ -64,7 +64,6 @@ impl<'a> GlobalLinker<'a> {
     self.emit_image()?;
     self.rewrite_image_call_return()?;
     self.emit_offset_table()?;
-    self.print_disassembly();
     let mut image = Image::default();
     image.code = std::mem::replace(&mut self.image, vec![]);
     image.machine = Some(self.config.target_machine.clone());
@@ -296,11 +295,11 @@ impl<'a> GlobalLinker<'a> {
         imm: 0,
       },
       Insn {
-        opc: LD_DW_REG,
-        src: 10,
+        opc: ADD64_IMM,
+        src: 0,
         dst: 10,
-        off: 80,
-        imm: 0,
+        off: 0,
+        imm: 80,
       },
       // RETURN
       Insn {
@@ -323,7 +322,7 @@ impl<'a> GlobalLinker<'a> {
       let object = &mut self.objects[obj_index];
       let func = &mut object.functions[func_index];
       func.global_linked_offset = self.image.len();
-      log::info!(
+      log::debug!(
         "emitting function {}:{} at {} len {}",
         object.name,
         func.name,
@@ -337,37 +336,6 @@ impl<'a> GlobalLinker<'a> {
     }
 
     Ok(())
-  }
-
-  fn print_disassembly(&self) {
-    let offset_to_func = self
-      .all_functions
-      .values()
-      .map(|&(obj_index, func_index)| {
-        let object = &self.objects[obj_index];
-        let func = &object.functions[func_index];
-        (func.global_linked_offset, (obj_index, func_index))
-      })
-      .collect::<FnvIndexMap<_, _>>();
-    let mut off = 0usize;
-    while off < self.image.len() {
-      if let Some((obj_index, func_index)) = offset_to_func.get(&off) {
-        let object = &self.objects[*obj_index];
-        let func = &object.functions[*func_index];
-        log::info!("\n<{}:{}>:", object.name, func.name);
-      }
-      let insn_len = if self.image[off] == LD_DW_IMM {
-        16usize
-      } else {
-        8usize
-      };
-      let insn = super::ebpf_disassembler::to_insn_vec(&self.image[off..off + insn_len])
-        .into_iter()
-        .next()
-        .unwrap();
-      log::info!("\t{}", insn.desc);
-      off += insn_len;
-    }
   }
 
   fn rewrite_image_call_return(&mut self) -> Result<()> {
