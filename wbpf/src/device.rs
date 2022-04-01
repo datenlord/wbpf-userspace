@@ -60,9 +60,7 @@ impl Device {
     let buf_size = std::mem::size_of::<wbpf_uapi_pe_exception_state>() * self.num_pe as usize;
     let file = self.file.lock().await;
     loop {
-      log::debug!("es poll start");
       let mut guard = file.readable().await?;
-      log::debug!("es readable");
 
       match guard.try_io(|inner| {
         inner

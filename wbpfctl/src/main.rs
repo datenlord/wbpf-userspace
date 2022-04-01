@@ -122,6 +122,10 @@ enum Command {
     /// Host platform YAML/JSON config.
     #[structopt(long)]
     host_platform: Option<PathBuf>,
+
+    /// Comma-delimited dead code elimination root functions.
+    #[structopt(long)]
+    dce_roots: Option<String>,
   },
 
   /// Load image.
@@ -240,6 +244,7 @@ async fn main() -> Result<()> {
       output,
       target_machine,
       host_platform,
+      dce_roots,
     } => {
       let target_machine: TargetMachine = if let Some(p) = &target_machine {
         serde_yaml::from_str(&std::fs::read_to_string(p)?)?
@@ -254,6 +259,7 @@ async fn main() -> Result<()> {
       let config = GlobalLinkerConfig {
         target_machine,
         host_platform,
+        dce_roots: dce_roots.map(|x| x.split(',').map(|x| x.to_string()).collect()),
       };
       let image = link_files(config, &input)?;
       if let Some(p) = &output {
@@ -273,8 +279,15 @@ async fn main() -> Result<()> {
       }
       let image = read_input(&input)?;
       device.stop(pe_index)?;
-      let es = device.read_exception_state().await?;
-      log::info!("stop ok");
+      loop {
+        let es = device.read_exception_state().await?;
+        let es = &es[pe_index as usize];
+
+        // STOP | INTR
+        if es.code == 0x80000007u32 {
+          break;
+        }
+      }
       let image = Image::decode(image.as_slice())?;
       device.load_image(pe_index, &image)?;
 
@@ -297,10 +310,18 @@ async fn main() -> Result<()> {
       dm.do_dma_write(0, unsafe {
         std::slice::from_raw_parts(state_snapshot.as_ptr() as *const u8, size)
       })?;
+      let start_perfctr = device.read_perf_counters(pe_index)?;
       device.start(pe_index, 0)?;
-      log::info!("Start OK");
-      let es = device.read_exception_state().await?;
-      println!("new es: {:?}", es[pe_index as usize]);
+      let es = loop {
+        let es = device.read_exception_state().await?;
+        let es = es.into_iter().nth(pe_index as usize).unwrap();
+        if es.code & 0x80000000u32 != 0 {
+          break es;
+        }
+      };
+      let end_perfctr = device.read_perf_counters(pe_index)?;
+      println!("new es: {:?}", es);
+      println!("cycles={} commits={}", end_perfctr.cycles - start_perfctr.cycles, end_perfctr.commits - start_perfctr.commits);
     }
     Command::DisassembleImage { input, binary } => {
       let image = read_input(&input)?;
