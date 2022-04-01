@@ -126,8 +126,8 @@ enum Command {
     dce_roots: Option<String>,
   },
 
-  /// Load image.
-  LoadImage {
+  /// Run image.
+  Run {
     /// Input file.
     #[structopt(long, short = "i")]
     input: PathBuf,
@@ -258,65 +258,16 @@ async fn main() -> Result<()> {
         output.write_all(&image.encode_to_vec())?;
       }
     }
-    Command::LoadImage {
+    Command::Run {
       input,
       pe_index,
       state,
     } => {
       let device = open_device()?;
-      let state: MachineState = serde_yaml::from_str(&std::fs::read_to_string(&state)?)?;
-      if state.registers.len() != 11 {
-        return Err(anyhow::anyhow!("invalid state"));
-      }
       let image = read_input(&input)?;
-      device.stop(pe_index)?;
-      loop {
-        let es = device.read_exception_state().await?;
-        let es = &es[pe_index as usize];
-
-        // STOP | INTR
-        if es.code == 0x80000007u32 {
-          break;
-        }
-      }
       let image = Image::decode(image.as_slice())?;
-      device.load_image(pe_index, &image)?;
-
-      let offset_table = image
-        .offset_table
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no offset table"))?;
-
-      let offset = *offset_table
-        .func_offsets
-        .get(&state.entry_point)
-        .ok_or_else(|| anyhow::anyhow!("no entry point"))?;
-      let mut state_snapshot = [0u64; 11];
-      for i in 0..11 {
-        state_snapshot[i] = state.registers[i] as u64;
-      }
-      state_snapshot[10] = (state_snapshot[10] << 32) | (offset as u64);
-      let size = std::mem::size_of_val(&state_snapshot);
-      let dm = device.data_memory().await?;
-      dm.do_dma_write(0, unsafe {
-        std::slice::from_raw_parts(state_snapshot.as_ptr() as *const u8, size)
-      })?;
-      let start_perfctr = device.read_perf_counters(pe_index)?;
-      device.start(pe_index, 0)?;
-      let es = loop {
-        let es = device.read_exception_state().await?;
-        let es = es.into_iter().nth(pe_index as usize).unwrap();
-        if es.code & 0x80000000u32 != 0 {
-          break es;
-        }
-      };
-      let end_perfctr = device.read_perf_counters(pe_index)?;
-      println!("new es: {:?}", es);
-      println!(
-        "cycles={} commits={}",
-        end_perfctr.cycles - start_perfctr.cycles,
-        end_perfctr.commits - start_perfctr.commits
-      );
+      let state: MachineState = serde_yaml::from_str(&std::fs::read_to_string(&state)?)?;
+      device.run(&image, &state, pe_index).await?;
     }
     Command::DisassembleImage { input, binary } => {
       let image = read_input(&input)?;

@@ -172,14 +172,39 @@ impl Device {
     })
   }
 
-  pub fn load_image(&self, pe_index: u32, image: &Image) -> Result<()> {
+  pub async fn load_image(&self, pe_index: u32, image: &Image) -> Result<()> {
     self.load_code(pe_index, 0, &image.code)?;
+
+    if image.data.len() != 0 {
+      let platform = image
+        .platform
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no platform"))?;
+      if platform.data_offset < 0x100 {
+        anyhow::bail!("data offset too small");
+      }
+      let dm = self.data_memory().await?;
+      let mut data = image.data.clone();
+      // Align data to 8 bytes
+      let len_diff = 7 - (data.len() + 7) % 8;
+      data.extend((0..len_diff).map(|_| 0u8));
+      dm.do_dma_write(platform.data_offset as u32, &data)?;
+      log::debug!(
+        "written data memory with offset {} and length {}",
+        platform.data_offset,
+        image.data.len()
+      );
+    }
     Ok(())
   }
 
   pub async fn run(&self, image: &Image, state: &MachineState, pe_index: u32) -> Result<()> {
+    if state.registers.len() != 11 {
+      return Err(anyhow::anyhow!("invalid state"));
+    }
+
     self.stop_and_wait(pe_index).await?;
-    self.load_image(pe_index, &image)?;
+    self.load_image(pe_index, &image).await?;
 
     let offset_table = image
       .offset_table
